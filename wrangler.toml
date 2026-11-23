@@ -1,3 +1,15 @@
 name = "jhub-gate"
 main = "cf-worker/src/index.js"
 compatibility_date = "2026-11-01"
+
+# Free-tier ad-gated key pool. The namespace below already exists
+# (created 2026-11-22, title "JHUB_FREE_POOL"); seed it once with
+# cf-worker/free_pool_seed.json before the /freekey route can hand
+# anything out.
+[[kv_namespaces]]
+binding = "FREE_POOL"
+id = "b5666fabc63b45a6845816e1cea56598"
+
+# Also required, set via dashboard or `wrangler secret put LINKVERTISE_TOKEN`:
+# the 64-char anti-bypass token from your Linkvertise dashboard.
+# Not stored here -- secrets never go in this file.

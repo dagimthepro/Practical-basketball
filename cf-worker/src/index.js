@@ -7,10 +7,25 @@
 // fetches is still fully encrypted ciphertext -- publishing it is no
 // different from publishing the old .lua file; the actual gate is here.
 //
-// No bindings, no secrets, no build step needed -- deploys as-is.
+// This file now also serves /freekey -- the landing page for the free,
+// ad-gated tier. Linkvertise's Target-Link anti-bypass feature appends
+// ?hash=<64 hex chars> to this URL only once a visitor has genuinely
+// completed the ad flow (not just been redirected through it); we verify
+// that hash server-to-server against Linkvertise's own API before ever
+// handing out a key, which is what actually defeats bypass tools (they
+// can fake the redirect, they can't fake Linkvertise's own completion
+// state). See cf-worker/README_FREEKEY.md for the required bindings.
+//
+// Needs two things this script alone can't provide: a Worker secret
+// named LINKVERTISE_TOKEN (your 64-char anti-bypass token from the
+// Linkvertise dashboard) and a KV binding named FREE_POOL (pre-seeded
+// with unused free keys). Everything else deploys as-is.
 
 const SIDECAR_URL =
   "https://raw.githubusercontent.com/dagimthepro/Practical-basketball/main/dist/jhub_sidecar.json";
+
+const LINKVERTISE_VERIFY_URL =
+  "https://publisher.linkvertise.com/api/v1/anti_bypassing";
 
 function fnv1a32(bytes) {
   let h = 0x811c9dc5; // 2166136261
@@ -126,9 +141,114 @@ function reconstruct(M, sidecar) {
   return concatBytes(...parts);
 }
 
+function htmlPage(title, bodyHtml, status) {
+  return new Response(
+    `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${title}</title>
+<style>body{background:#0f1115;color:#eee;font-family:system-ui,sans-serif;
+display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{background:#181b22;border-radius:12px;padding:32px;max-width:480px;text-align:center}
+.key{font-size:20px;font-weight:700;background:#0f1115;border-radius:8px;padding:14px;
+margin:16px 0;word-break:break-all;color:#7CFC7C}
+button{background:#3b5bff;color:#fff;border:0;border-radius:8px;padding:10px 18px;
+font-size:14px;cursor:pointer}
+a{color:#7aa2ff}</style></head>
+<body><div class="card">${bodyHtml}</div></body></html>`,
+    { status: status || 200, headers: { "content-type": "text/html; charset=utf-8" } }
+  );
+}
+
+// Calls Linkvertise's own backend to ask whether this specific hash
+// corresponds to a visitor who actually completed the ad flow. A hash can
+// only be confirmed once -- Linkvertise deletes it server-side on success --
+// so this also can't be replayed even if someone captures the URL.
+async function verifyLinkvertiseHash(hash, token) {
+  const verifyUrl = `${LINKVERTISE_VERIFY_URL}?token=${encodeURIComponent(token)}&hash=${encodeURIComponent(hash)}`;
+  const resp = await fetch(verifyUrl, { method: "POST" });
+  const text = (await resp.text()).trim();
+  return /^true$/i.test(text);
+}
+
+// Claims one "available" key from the free-tier pool. Not perfectly atomic
+// under heavy concurrency (list-then-put), but the pool is small and
+// low-traffic, so a rare double-claim is an acceptable tradeoff rather than
+// something worth a Durable Object for.
+async function claimFreeKey(pool, hash) {
+  const list = await pool.list({ limit: 1000 });
+  for (const entry of list.keys) {
+    if (entry.metadata && entry.metadata.status === "available") {
+      await pool.put(entry.name, "issued", {
+        metadata: { status: "issued", at: Date.now(), hash },
+      });
+      return entry.name;
+    }
+  }
+  return null;
+}
+
+async function handleFreeKey(request, env) {
+  const url = new URL(request.url);
+  const hash = url.searchParams.get("hash") || "";
+
+  if (!hash) {
+    return htmlPage(
+      "JHub - get a free key",
+      `<h2>Missing link</h2><p>Open this page through the Linkvertise link, not directly.</p>`,
+      400
+    );
+  }
+  if (!env.LINKVERTISE_TOKEN || !env.FREE_POOL) {
+    return htmlPage(
+      "JHub - not configured",
+      `<h2>Not set up yet</h2><p>This Worker is missing its LINKVERTISE_TOKEN secret or FREE_POOL KV binding.</p>`,
+      500
+    );
+  }
+
+  let verified = false;
+  try {
+    verified = await verifyLinkvertiseHash(hash, env.LINKVERTISE_TOKEN);
+  } catch (e) {
+    return htmlPage(
+      "JHub - verification failed",
+      `<h2>Couldn't verify</h2><p>Linkvertise's check didn't respond. Try again in a moment.</p>`,
+      502
+    );
+  }
+  if (!verified) {
+    return htmlPage(
+      "JHub - not verified",
+      `<h2>Link not completed</h2><p>This link looks like it was skipped or already used. Go back and complete the ad flow again to get a key.</p>`,
+      403
+    );
+  }
+
+  const key = await claimFreeKey(env.FREE_POOL, hash);
+  if (!key) {
+    return htmlPage(
+      "JHub - out of keys",
+      `<h2>Out of free keys right now</h2><p>The free-tier pool is empty. Check back soon.</p>`,
+      503
+    );
+  }
+
+  return htmlPage(
+    "JHub - your free key",
+    `<h2>You're unlocked</h2>
+     <p>Paste this key into the JHub key prompt:</p>
+     <div class="key" id="k">${key}</div>
+     <button onclick="navigator.clipboard.writeText(document.getElementById('k').textContent)">Copy key</button>
+     <p style="opacity:.6;font-size:12px;margin-top:16px">This key is yours -- don't share it, or it may get pulled from the pool.</p>`
+  );
+}
+
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     const url = new URL(request.url);
+
+    if (url.pathname === "/freekey") {
+      return handleFreeKey(request, env);
+    }
+
     const key =
       url.searchParams.get("key") ||
       request.headers.get("x-jhub-key") ||

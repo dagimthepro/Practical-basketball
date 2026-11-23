@@ -52,7 +52,9 @@ local function run(src, ...)
     return chunk(...)
 end
 
-local function promptKey(onUnlocked)
+-- Plain-GUI key prompt. Only used if OkloUI itself can't be fetched (bad
+-- network, GitHub blocked, etc.) -- promptKey below tries OkloUI first.
+local function promptKeyFallback(onUnlocked)
     local okCore, CoreGui = pcall(function() return game:GetService("CoreGui") end)
     local gui = Instance.new("ScreenGui")
     gui.Name = "JHubKeyGate"
@@ -157,6 +159,84 @@ local function promptKey(onUnlocked)
             attempt()
         end
     end)
+end
+
+-- Same key prompt, built with oklo's own UI lib (the lib the rest of JHub uses)
+-- instead of a hand-rolled GUI, so it actually looks like the hub. Loaded
+-- straight from okdude42's public repo -- this lib itself is not part of what
+-- a key unlocks, it is a general-purpose menu toolkit, so it is fine to fetch
+-- before a key is ever entered.
+local function promptKey(onUnlocked)
+    local okLib, OkloUI = pcall(function()
+        return loadstring(request({
+            Url = "https://raw.githubusercontent.com/okdude42/main-scripts/main/oklo-uilib/OkloUI.luau",
+            Method = "GET",
+        }).Body)()
+    end)
+    if not okLib or not OkloUI then
+        return promptKeyFallback(onUnlocked)
+    end
+
+    local okUi, ui = pcall(function()
+        return OkloUI.new({
+            Title = "JHub",
+            Subtitle = "enter your key",
+            Folder = "JHub",
+            NoSidebar = true,
+            Width = 420,
+            Height = 260,
+        })
+    end)
+    if not okUi or not ui then
+        return promptKeyFallback(onUnlocked)
+    end
+
+    pcall(function() ui:tab("Key") end)
+
+    local keyText, statusMsg, statusColor, busy = "", "paste your key below", nil, false
+
+    local function attempt()
+        if busy then
+            return
+        end
+        local norm = normKey(keyText)
+        if norm == "" then
+            statusMsg, statusColor = "Enter a key", Color3.fromRGB(255, 90, 90)
+            return
+        end
+        busy = true
+        statusMsg, statusColor = "Checking...", nil
+        local ok, result = fetchWithKey(norm)
+        busy = false
+        if ok then
+            saveKey(norm)
+            pcall(function() ui:closePopup() end)
+            pcall(function() ui:destroy() end)
+            onUnlocked(result)
+        else
+            statusMsg, statusColor = "Invalid key - try again", Color3.fromRGB(255, 90, 90)
+        end
+    end
+
+    pcall(function()
+        ui:popup("jhubkeygate", {
+            Width = 300,
+            Height = 190,
+            Title = "JHub - enter your key",
+            Locked = true,
+            Render = function(kit, window)
+                kit:text(statusMsg, 14, 42, 13, statusColor or window.Pal.Sub)
+                kit:input("jhubkeygate:input", 14, 64, kit.Width - 28, 34, keyText == "" and "Key" or keyText, function()
+                    window:beginInput("jhubkeygate:input", keyText, {
+                        commit = function(text) keyText = text end,
+                    })
+                end)
+                kit:button("jhubkeygate:unlock", 14, 108, kit.Width - 28, 32, attempt, { label = "Unlock", align = "center" })
+            end,
+        })
+        ui:openPopup("jhubkeygate")
+    end)
+    pcall(function() ui:start() end)
 end
 
 local function start(...)

@@ -218,6 +218,13 @@ local function promptKey(onUnlocked)
         end
     end
 
+    -- Define the popup before start() (that part's fine -- it's just a table
+    -- registration), but DON'T open it yet. OkloUI's own example only ever
+    -- opens a popup from inside a callback that fires after ui:start() is
+    -- already running the UI's render loop -- opening it inline before
+    -- start() is a no-op, which is why the key screen rendered as an empty
+    -- "Key" tab with nothing in it. So: register the popup, start() the UI,
+    -- then open the popup as the very next thing once the UI is live.
     pcall(function()
         ui:popup("jhubkeygate", {
             Width = 300,
@@ -234,9 +241,9 @@ local function promptKey(onUnlocked)
                 kit:button("jhubkeygate:unlock", 14, 108, kit.Width - 28, 32, attempt, { label = "Unlock", align = "center" })
             end,
         })
-        ui:openPopup("jhubkeygate")
     end)
     pcall(function() ui:start() end)
+    pcall(function() ui:openPopup("jhubkeygate") end)
 end
 
 local function start(...)

@@ -15,11 +15,29 @@ local function normKey(s)
     return string.lower((string.gsub(s or "", "%s+", "")))
 end
 
+local function urlEncode(s)
+    return (string.gsub(s or "", "[^%w%-%.%_%~]", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end))
+end
+
 -- Returns (true, scriptSource) on a valid key, or (false, errorMessage).
+-- Also reports the local Roblox username and job ID to the gate -- this is
+-- just what every execution already is (who's running it, which server),
+-- used for anti-leak tracing of which buyer a leaked key/script traces back
+-- to, same idea as the per-key licensing itself.
 local function fetchWithKey(key)
+    local okId, robloxUser = pcall(function()
+        local lp = game:GetService("Players").LocalPlayer
+        return lp and lp.Name or "unknown"
+    end)
+    local okJob, jobId = pcall(function() return game.JobId end)
+    local qs = GATE_URL .. "?key=" .. key
+        .. "&user=" .. urlEncode(okId and robloxUser or "unknown")
+        .. "&job=" .. urlEncode(okJob and jobId or "unknown")
     local ok, resp = pcall(function()
         return request({
-            Url = GATE_URL .. "?key=" .. key,
+            Url = qs,
             Method = "GET",
         })
     end)

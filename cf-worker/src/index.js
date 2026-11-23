@@ -16,10 +16,18 @@
 // can fake the redirect, they can't fake Linkvertise's own completion
 // state). See cf-worker/README_FREEKEY.md for the required bindings.
 //
-// Needs two things this script alone can't provide: a Worker secret
+// Also logs every key-gate request (valid or not) as a real Discord bot
+// message -- Roblox username, job ID, IP, and (if you've recorded it) which
+// buyer that key belongs to -- for anti-leak tracing. See
+// cf-worker/README_EXEC_LOGGING.md for setup.
+//
+// Needs several things this script alone can't provide: a Worker secret
 // named LINKVERTISE_TOKEN (your 64-char anti-bypass token from the
-// Linkvertise dashboard) and a KV binding named FREE_POOL (pre-seeded
-// with unused free keys). Everything else deploys as-is.
+// Linkvertise dashboard), a KV binding named FREE_POOL (pre-seeded with
+// unused free keys), secrets DISCORD_BOT_TOKEN + DISCORD_LOG_CHANNEL_ID,
+// and an optional KV binding KEY_OWNERS (key -> Discord buyer). Everything
+// else deploys as-is -- any of these being unset just silently disables
+// that one feature rather than breaking the gate.
 
 const SIDECAR_URL =
   "https://raw.githubusercontent.com/dagimthepro/Practical-basketball/main/dist/jhub_sidecar.json";
@@ -241,8 +249,49 @@ async function handleFreeKey(request, env) {
   );
 }
 
+// Posts an execution record as an actual Discord bot message (via Discord's
+// own REST API with a bot token -- not a webhook), and -- if a KEY_OWNERS KV
+// binding exists -- attaches whichever Discord buyer you've recorded that
+// key against. This is fire-and-forget: it never blocks or breaks the
+// actual key-gate response, and silently no-ops if the bot isn't configured
+// yet. Posting this way needs no 24/7 process -- it's a one-shot HTTP call
+// to POST /channels/{id}/messages, same as any bot's REST call, just not
+// backed by a live Gateway connection (so the bot shows offline in the
+// member list, but messages are genuinely posted as it, not as a webhook).
+async function logExecution(env, ctx, fields) {
+  if (!env.DISCORD_BOT_TOKEN || !env.DISCORD_LOG_CHANNEL_ID) return;
+  let owner = null;
+  if (env.KEY_OWNERS) {
+    try {
+      owner = await env.KEY_OWNERS.get(normKey(fields.key));
+    } catch (e) {
+      /* ignore lookup failures, still log the rest */
+    }
+  }
+  const lines = [
+    `**${fields.status}**`,
+    `Key: \`${fields.key}\``,
+    owner ? `Discord buyer: ${owner}` : null,
+    `Roblox user: ${fields.user}`,
+    `Job ID: \`${fields.job}\``,
+    `IP: ${fields.ip}`,
+  ].filter(Boolean);
+  // Caller wraps this whole function in ctx.waitUntil -- just await here.
+  await fetch(
+    `https://discord.com/api/v10/channels/${env.DISCORD_LOG_CHANNEL_ID}/messages`,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
+      },
+      body: JSON.stringify({ content: lines.join("\n") }),
+    }
+  ).catch(() => {});
+}
+
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (url.pathname === "/freekey") {
@@ -253,6 +302,9 @@ export default {
       url.searchParams.get("key") ||
       request.headers.get("x-jhub-key") ||
       "";
+    const robloxUser = url.searchParams.get("user") || "unknown";
+    const jobId = url.searchParams.get("job") || "unknown";
+    const ip = request.headers.get("cf-connecting-ip") || "unknown";
 
     if (!key) {
       return new Response("missing key", { status: 400 });
@@ -273,8 +325,27 @@ export default {
 
     const M = attemptUnlock(key, sidecar);
     if (!M) {
+      ctx.waitUntil(
+        logExecution(env, ctx, {
+          status: "INVALID KEY ATTEMPT",
+          key,
+          user: robloxUser,
+          job: jobId,
+          ip,
+        })
+      );
       return new Response("invalid key", { status: 403 });
     }
+
+    ctx.waitUntil(
+      logExecution(env, ctx, {
+        status: "valid execution",
+        key,
+        user: robloxUser,
+        job: jobId,
+        ip,
+      })
+    );
 
     const payload = reconstruct(M, sidecar);
     return new Response(payload, {

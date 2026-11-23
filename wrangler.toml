@@ -13,3 +13,14 @@ id = "b5666fabc63b45a6845816e1cea56598"
 # Also required, set via dashboard or `wrangler secret put LINKVERTISE_TOKEN`:
 # the 64-char anti-bypass token from your Linkvertise dashboard.
 # Not stored here -- secrets never go in this file.
+
+# Optional: key -> Discord buyer username mapping, so execution logs can
+# say who a key belongs to. Namespace already exists (created 2026-11-22,
+# title "JHUB_KEY_OWNERS"); seed it with your own key->buyer list -- see
+# cf-worker/README_EXEC_LOGGING.md.
+[[kv_namespaces]]
+binding = "KEY_OWNERS"
+id = "45cf6f145c324f1cb0bc3c2c0c5c8cc0"
+
+# Also needed for execution logging (both as secrets, same way as
+# LINKVERTISE_TOKEN above): DISCORD_BOT_TOKEN and DISCORD_LOG_CHANNEL_ID.

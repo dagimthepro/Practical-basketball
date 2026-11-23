@@ -334,6 +334,63 @@ async function handleMyKey(request, env) {
   });
 }
 
+// Internal-only endpoint for the bot's /linkkey and /unlinkkey commands.
+// The bot itself decides who's allowed to call this (co-owners only); this
+// endpoint only checks that the caller IS the bot, via the same shared
+// secret as /api/mykey. Writing is a straight KV put/delete -- normKey
+// keeps lookups consistent with how logExecution and findKeyByDiscordId
+// already read this namespace.
+async function handleLinkKey(request, env) {
+  if (!env.INTERNAL_SECRET || request.headers.get("x-internal-secret") !== env.INTERNAL_SECRET) {
+    return new Response("unauthorized", { status: 401 });
+  }
+  if (!env.KEY_OWNERS) {
+    return new Response(JSON.stringify({ ok: false, reason: "KEY_OWNERS not configured" }), {
+      status: 500,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (request.method !== "POST") {
+    return new Response("method not allowed", { status: 405 });
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return new Response(JSON.stringify({ ok: false, reason: "invalid JSON body" }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const key = normKey(body.key);
+  if (!key) {
+    return new Response(JSON.stringify({ ok: false, reason: "missing key" }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const url = new URL(request.url);
+  if (url.pathname === "/api/unlinkkey") {
+    await env.KEY_OWNERS.delete(key);
+    return new Response(JSON.stringify({ ok: true, key, unlinked: true }), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const discordId = (body.discordId || "").trim();
+  if (!discordId) {
+    return new Response(JSON.stringify({ ok: false, reason: "missing discordId" }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  await env.KEY_OWNERS.put(key, discordId);
+  return new Response(JSON.stringify({ ok: true, key, discordId }), {
+    headers: { "content-type": "application/json" },
+  });
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -344,6 +401,10 @@ export default {
 
     if (url.pathname === "/api/mykey") {
       return handleMyKey(request, env);
+    }
+
+    if (url.pathname === "/api/linkkey" || url.pathname === "/api/unlinkkey") {
+      return handleLinkKey(request, env);
     }
 
     const key =

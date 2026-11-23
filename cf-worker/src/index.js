@@ -290,12 +290,60 @@ async function logExecution(env, ctx, fields) {
   ).catch(() => {});
 }
 
+// Reverse-looks-up a Discord user ID in KEY_OWNERS (which is stored the
+// other way around: key -> Discord buyer). KEY_OWNERS is small and
+// low-traffic, so a full scan on each lookup is fine -- no need for a
+// second KV namespace just to index it the other direction.
+async function findKeyByDiscordId(pool, discordId) {
+  let cursor;
+  do {
+    const page = await pool.list({ cursor });
+    for (const entry of page.keys) {
+      const owner = await pool.get(entry.name);
+      if (owner === discordId) return entry.name;
+    }
+    cursor = page.cursor;
+  } while (cursor);
+  return null;
+}
+
+// Internal-only endpoint the presence bot calls for the /mykey slash
+// command. Gated behind a shared secret (set as the INTERNAL_SECRET
+// Worker secret) -- never exposed to end users, since it would otherwise
+// let anyone enumerate keys by guessing Discord IDs.
+async function handleMyKey(request, env) {
+  if (!env.INTERNAL_SECRET || request.headers.get("x-internal-secret") !== env.INTERNAL_SECRET) {
+    return new Response("unauthorized", { status: 401 });
+  }
+  if (!env.KEY_OWNERS) {
+    return new Response(JSON.stringify({ found: false, reason: "KEY_OWNERS not configured" }), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const url = new URL(request.url);
+  const discordId = url.searchParams.get("discord") || "";
+  if (!discordId) {
+    return new Response(JSON.stringify({ found: false, reason: "missing discord id" }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const key = await findKeyByDiscordId(env.KEY_OWNERS, discordId);
+  return new Response(JSON.stringify({ found: !!key, key: key || undefined }), {
+    headers: { "content-type": "application/json" },
+  });
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (url.pathname === "/freekey") {
       return handleFreeKey(request, env);
+    }
+
+    if (url.pathname === "/api/mykey") {
+      return handleMyKey(request, env);
     }
 
     const key =

@@ -138,7 +138,14 @@ export default {
       return new Response("missing key", { status: 400 });
     }
 
-    const sidecarResp = await fetch(SIDECAR_URL, { cf: { cacheTtl: 30 } });
+    // GitHub's raw.githubusercontent.com CDN caches by URL for several
+    // minutes regardless of our own cache directives, which would delay a
+    // revocation taking effect. A cache-busting query param defeats both
+    // that CDN's cache and Cloudflare's own edge cache, so a key removed
+    // from keys.txt stops working on the very next request, not minutes
+    // later.
+    const bustedUrl = SIDECAR_URL + "?_=" + Date.now();
+    const sidecarResp = await fetch(bustedUrl, { cf: { cacheTtl: 0 } });
     if (!sidecarResp.ok) {
       return new Response("sidecar unavailable", { status: 502 });
     }

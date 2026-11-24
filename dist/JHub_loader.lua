@@ -52,15 +52,16 @@ local function fetchWithKey(key)
         })
     end)
     if not ok then
-        return false, "request failed: " .. tostring(resp)
+        return false, "request failed: " .. tostring(resp), false
     end
     if resp.StatusCode == 200 and type(resp.Body) == "string" and #resp.Body > 0 then
         return true, resp.Body
     end
     if resp.StatusCode == 403 then
-        return false, "invalid key"
+        -- the gate said no for a real reason (invalid / blacklisted / expired / wrong device)
+        return false, (type(resp.Body) == "string" and #resp.Body > 0 and #resp.Body < 80) and resp.Body or "invalid key", true
     end
-    return false, "gate returned " .. tostring(resp.StatusCode) .. ": " .. tostring(resp.Body)
+    return false, "gate returned " .. tostring(resp.StatusCode) .. ": " .. tostring(resp.Body), false
 end
 
 local function saveKey(norm)
@@ -178,7 +179,7 @@ local function promptKeyFallback(onUnlocked)
             pcall(function() gui:Destroy() end)
             onUnlocked(result)
         else
-            errLabel.Text = "Invalid key - try again"
+            errLabel.Text = (type(result) == "string" and #result < 60) and result or "Invalid key - try again"
         end
     end
     btn.MouseButton1Click:Connect(attempt)
@@ -242,7 +243,7 @@ local function promptKey(onUnlocked)
             pcall(function() ui:destroy() end)
             onUnlocked(result)
         else
-            statusMsg, statusColor = "Invalid key - try again", Color3.fromRGB(255, 90, 90)
+            statusMsg, statusColor = (type(result) == "string" and #result < 60) and result or "Invalid key - try again", Color3.fromRGB(255, 90, 90)
         end
     end
 
@@ -283,11 +284,24 @@ local function start(...)
 
     local storedOk, storedKey = pcall(readfile, KEY_FILE)
     if storedOk and type(storedKey) == "string" and storedKey ~= "" then
-        local ok, result = fetchWithKey(normKey(storedKey))
+        local ok, result, definitive = fetchWithKey(normKey(storedKey))
+        local tries = 1
+        -- a network hiccup / server error while joining a match is NOT a bad key: retry quietly instead of
+        -- popping the key screen up every match
+        while not ok and not definitive and tries < 4 do
+            task.wait(2)
+            tries += 1
+            ok, result, definitive = fetchWithKey(normKey(storedKey))
+        end
         if ok then
             return proceedWith(result)
         end
-        -- stored key no longer works (revoked, corrupted, etc.) -- fall through to prompt
+        if not definitive then
+            warn("[JHub] could not reach the key server (" .. tostring(result) .. ") - not asking for your key again, just re-run the script")
+            return
+        end
+        warn("[JHub] your saved key was refused: " .. tostring(result))
+        -- a real refusal (revoked, expired, wrong device...) falls through to the prompt
     end
     promptKey(proceedWith)
 end

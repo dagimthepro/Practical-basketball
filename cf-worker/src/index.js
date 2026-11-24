@@ -104,6 +104,16 @@ function strToBytes(s) {
   return new TextEncoder().encode(s);
 }
 
+// Compares two strings without bailing out at the first difference.
+function safeEqual(a, b) {
+  a = String(a || "");
+  b = String(b || "");
+  let diff = a.length ^ b.length;
+  const n = Math.max(a.length, b.length);
+  for (let i = 0; i < n; i++) diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  return diff === 0;
+}
+
 function normKey(raw) {
   return (raw || "").replace(/\s+/g, "").toLowerCase();
 }
@@ -268,13 +278,17 @@ async function logExecution(env, ctx, fields) {
       /* ignore lookup failures, still log the rest */
     }
   }
+  // key / user / job come straight from the query string, so strip anything that could break out of the
+  // formatting or ping people (backticks, newlines, @everyone) and keep every field short.
+  const clean = (v, max) =>
+    String(v == null ? "" : v).replace(/[`\r\n]+/g, " ").replace(/@/g, "@\u200b").slice(0, max || 80);
   const lines = [
-    `**${fields.status}**`,
-    `Key: \`${fields.key}\``,
+    `**${clean(fields.status, 120)}**`,
+    `Key: \`${clean(fields.key, 64)}\``,
     owner ? `Discord buyer: ${owner}` : null,
-    `Roblox user: ${fields.user}`,
-    `Job ID: \`${fields.job}\``,
-    `IP: ${fields.ip}`,
+    `Roblox user: ${clean(fields.user, 64)}`,
+    `Job ID: \`${clean(fields.job, 64)}\``,
+    `IP: ${clean(fields.ip, 64)}`,
   ].filter(Boolean);
   // Caller wraps this whole function in ctx.waitUntil -- just await here.
   await fetch(
@@ -285,7 +299,7 @@ async function logExecution(env, ctx, fields) {
         "content-type": "application/json",
         authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
       },
-      body: JSON.stringify({ content: lines.join("\n") }),
+      body: JSON.stringify({ content: lines.join("\n"), allowed_mentions: { parse: [] } }),
     }
   ).catch(() => {});
 }
@@ -312,7 +326,7 @@ async function findKeyByDiscordId(pool, discordId) {
 // Worker secret) -- never exposed to end users, since it would otherwise
 // let anyone enumerate keys by guessing Discord IDs.
 async function handleMyKey(request, env) {
-  if (!env.INTERNAL_SECRET || request.headers.get("x-internal-secret") !== env.INTERNAL_SECRET) {
+  if (!env.INTERNAL_SECRET || !safeEqual(request.headers.get("x-internal-secret"), env.INTERNAL_SECRET)) {
     return new Response("unauthorized", { status: 401 });
   }
   if (!env.KEY_OWNERS && !env.KEYS) {
@@ -349,7 +363,7 @@ async function handleMyKey(request, env) {
 // keeps lookups consistent with how logExecution and findKeyByDiscordId
 // already read this namespace.
 async function handleLinkKey(request, env) {
-  if (!env.INTERNAL_SECRET || request.headers.get("x-internal-secret") !== env.INTERNAL_SECRET) {
+  if (!env.INTERNAL_SECRET || !safeEqual(request.headers.get("x-internal-secret"), env.INTERNAL_SECRET)) {
     return new Response("unauthorized", { status: 401 });
   }
   if (!env.KEY_OWNERS) {
@@ -501,7 +515,7 @@ async function findKeyRecordByDiscord(env, discordId) {
 // bot decides WHO may call what; this endpoint only checks the caller is
 // the bot.
 async function handleKeyApi(request, env) {
-  if (!env.INTERNAL_SECRET || request.headers.get("x-internal-secret") !== env.INTERNAL_SECRET) {
+  if (!env.INTERNAL_SECRET || !safeEqual(request.headers.get("x-internal-secret"), env.INTERNAL_SECRET)) {
     return new Response("unauthorized", { status: 401 });
   }
   if (!env.KEYS) return jsonResp({ ok: false, reason: "KEYS not configured" }, 500);
@@ -660,17 +674,23 @@ let payloadCache = null;
 let payloadInflight = null;
 
 async function buildLivePayload(env) {
-  const resp = await fetch(SIDECAR_URL + "?_=" + Date.now(), { cf: { cacheTtl: 0 } });
-  if (!resp.ok) return { error: "sidecar unavailable", status: 502 };
-  const sidecar = await resp.json();
-  const M = hexToBytes(env.MASTER_KEY);
-  if (
-    fnv1a32(M) !== sidecar.mhash ||
-    fnv1a32(concatBytes(strToBytes("check2|"), M)) !== sidecar.mhash2
-  ) {
-    return { error: "server misconfigured (master key mismatch)", status: 500 };
+  // Any failure here (GitHub hiccup, half-downloaded JSON, bad master key) must come back as an error
+  // value, never as a thrown exception: a throw would take down every request that was waiting on this build.
+  try {
+    const resp = await fetch(SIDECAR_URL + "?_=" + Date.now(), { cf: { cacheTtl: 0 } });
+    if (!resp.ok) return { error: "sidecar unavailable", status: 502 };
+    const sidecar = await resp.json();
+    const M = hexToBytes(env.MASTER_KEY);
+    if (
+      fnv1a32(M) !== sidecar.mhash ||
+      fnv1a32(concatBytes(strToBytes("check2|"), M)) !== sidecar.mhash2
+    ) {
+      return { error: "server misconfigured (master key mismatch)", status: 500 };
+    }
+    return { bytes: reconstruct(M, sidecar) };
+  } catch (e) {
+    return { error: "sidecar unavailable", status: 502 };
   }
-  return { bytes: reconstruct(M, sidecar) };
 }
 
 async function getLivePayload(env) {
@@ -738,7 +758,8 @@ export default {
     if (live) {
       const g = await liveGate(env, normKey(key), hwidRaw);
       if (g.error) {
-        if (shouldLogNoisy(normKey(key) + "|" + ip + "|" + g.error)) ctx.waitUntil(
+        // unknown keys are throttled per IP (an attacker can invent endless key strings); real keys per key + IP
+        if (shouldLogNoisy((g.rec ? normKey(key) : "unknown") + "|" + ip + "|" + g.error)) ctx.waitUntil(
           logExecution(env, ctx, {
             status: g.status === 403 ? "INVALID/BLOCKED ATTEMPT: " + g.error : "ERROR: " + g.error,
             key, user: robloxUser, job: jobId, ip,

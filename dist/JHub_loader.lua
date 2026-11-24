@@ -11,6 +11,15 @@
 local GATE_URL = "https://practical-basketball.dagimwww.workers.dev/"
 local KEY_FILE = "JHub/PB/jhub.key"
 
+-- executors expose the HTTP function under different names
+local function httpRequest(options)
+    local fn = request or http_request or (syn and syn.request) or (http and http.request)
+    if type(fn) ~= "function" then
+        error("this executor has no http request function")
+    end
+    return fn(options)
+end
+
 local function normKey(s)
     return string.lower((string.gsub(s or "", "%s+", "")))
 end
@@ -41,12 +50,12 @@ local function fetchWithKey(key)
         return lp and lp.Name or "unknown"
     end)
     local okJob, jobId = pcall(function() return game.JobId end)
-    local qs = GATE_URL .. "?key=" .. key
+    local qs = GATE_URL .. "?key=" .. urlEncode(key)
         .. "&user=" .. urlEncode(okId and robloxUser or "unknown")
         .. "&job=" .. urlEncode(okJob and jobId or "unknown")
         .. "&hwid=" .. urlEncode(getHwid())
     local ok, resp = pcall(function()
-        return request({
+        return httpRequest({
             Url = qs,
             Method = "GET",
         })
@@ -197,7 +206,7 @@ end
 -- before a key is ever entered.
 local function promptKey(onUnlocked)
     local okLib, OkloUI = pcall(function()
-        return loadstring(request({
+        return loadstring(httpRequest({
             Url = "https://raw.githubusercontent.com/okdude42/main-scripts/main/oklo-uilib/OkloUI.luau",
             Method = "GET",
         }).Body)()

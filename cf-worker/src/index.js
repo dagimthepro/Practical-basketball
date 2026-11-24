@@ -260,8 +260,8 @@ async function handleFreeKey(request, env) {
 // member list, but messages are genuinely posted as it, not as a webhook).
 async function logExecution(env, ctx, fields) {
   if (!env.DISCORD_BOT_TOKEN || !env.DISCORD_LOG_CHANNEL_ID) return;
-  let owner = null;
-  if (env.KEY_OWNERS) {
+  let owner = fields.ownerOverride || null;
+  if (!owner && env.KEY_OWNERS) {
     try {
       owner = await env.KEY_OWNERS.get(normKey(fields.key));
     } catch (e) {
@@ -315,20 +315,28 @@ async function handleMyKey(request, env) {
   if (!env.INTERNAL_SECRET || request.headers.get("x-internal-secret") !== env.INTERNAL_SECRET) {
     return new Response("unauthorized", { status: 401 });
   }
-  if (!env.KEY_OWNERS) {
-    return new Response(JSON.stringify({ found: false, reason: "KEY_OWNERS not configured" }), {
+  if (!env.KEY_OWNERS && !env.KEYS) {
+    return new Response(JSON.stringify({ found: false, reason: "no key store configured" }), {
       headers: { "content-type": "application/json" },
     });
   }
   const url = new URL(request.url);
   const discordId = url.searchParams.get("discord") || "";
+  if (env.KEYS && discordId) {
+    const hit = await findKeyRecordByDiscord(env, discordId);
+    if (hit) {
+      return new Response(JSON.stringify({ found: true, key: hit.key }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+  }
   if (!discordId) {
     return new Response(JSON.stringify({ found: false, reason: "missing discord id" }), {
       status: 400,
       headers: { "content-type": "application/json" },
     });
   }
-  const key = await findKeyByDiscordId(env.KEY_OWNERS, discordId);
+  const key = env.KEY_OWNERS ? await findKeyByDiscordId(env.KEY_OWNERS, discordId) : null;
   return new Response(JSON.stringify({ found: !!key, key: key || undefined }), {
     headers: { "content-type": "application/json" },
   });
@@ -391,6 +399,210 @@ async function handleLinkKey(request, env) {
   });
 }
 
+// ---------------------------------------------------------------------
+// Live key store (KEYS KV binding + MASTER_KEY secret)
+//
+// Each key is a KV record: { status, hwid, discord, created, note, lastReset }
+//   status: "active" | "blacklisted"
+//   hwid:   SHA-256 of the buyer's device id, bound on first use (or null)
+//   discord: Discord user ID the key was redeemed/linked to (or null)
+// The Worker holds the payload master key (MASTER_KEY, hex) as a secret, so
+// the public sidecar carries no per-key data at all. When KEYS/MASTER_KEY
+// aren't configured the old baked-in-wraps path below still works.
+// ---------------------------------------------------------------------
+const HWID_RESET_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return out;
+}
+
+async function sha256Hex(str) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function jsonResp(obj, status) {
+  return new Response(JSON.stringify(obj), {
+    status: status || 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function genKeyString() {
+  const A = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const rnd = crypto.getRandomValues(new Uint8Array(12));
+  const part = (o) => [...rnd.slice(o, o + 4)].map((b) => A[b % A.length]).join("");
+  return `JHUB-${part(0)}-${part(4)}-${part(8)}`;
+}
+
+async function getKeyRecord(env, key) {
+  return await env.KEYS.get(key, { type: "json" });
+}
+
+async function putKeyRecord(env, key, rec) {
+  await env.KEYS.put(key, JSON.stringify(rec));
+}
+
+async function findKeyRecordByDiscord(env, discordId) {
+  let cursor;
+  do {
+    const page = await env.KEYS.list({ cursor });
+    for (const entry of page.keys) {
+      const rec = await getKeyRecord(env, entry.name);
+      if (rec && rec.discord === discordId) return { key: entry.name, rec };
+    }
+    cursor = page.cursor;
+  } while (cursor);
+  return null;
+}
+
+// Management API used only by the Discord bot (shared-secret gated). The
+// bot decides WHO may call what; this endpoint only checks the caller is
+// the bot.
+async function handleKeyApi(request, env) {
+  if (!env.INTERNAL_SECRET || request.headers.get("x-internal-secret") !== env.INTERNAL_SECRET) {
+    return new Response("unauthorized", { status: 401 });
+  }
+  if (!env.KEYS) return jsonResp({ ok: false, reason: "KEYS not configured" }, 500);
+  if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return jsonResp({ ok: false, reason: "invalid JSON body" }, 400);
+  }
+  const action = new URL(request.url).pathname.replace("/api/key/", "");
+
+  if (action === "create") {
+    const count = Math.min(Math.max(parseInt(body.count || 1, 10) || 1, 1), 50);
+    const made = [];
+    for (let i = 0; i < count; i++) {
+      const key = normKey(genKeyString());
+      await putKeyRecord(env, key, {
+        status: "active",
+        hwid: null,
+        discord: body.discordId || null,
+        created: Date.now(),
+        note: body.note || "",
+        lastReset: 0,
+      });
+      made.push(key);
+    }
+    return jsonResp({ ok: true, keys: made });
+  }
+
+  if (action === "import") {
+    const keys = Array.isArray(body.keys) ? body.keys : [];
+    let added = 0;
+    for (const raw of keys) {
+      const key = normKey(raw);
+      if (!key || (await env.KEYS.get(key))) continue;
+      await putKeyRecord(env, key, {
+        status: "active", hwid: null, discord: null,
+        created: Date.now(), note: "imported", lastReset: 0,
+      });
+      added++;
+    }
+    return jsonResp({ ok: true, added });
+  }
+
+  const key = normKey(body.key);
+
+  if (action === "info") {
+    let found = null;
+    if (key) {
+      const rec = await getKeyRecord(env, key);
+      if (rec) found = { key, rec };
+    } else if (body.discordId) {
+      found = await findKeyRecordByDiscord(env, body.discordId);
+    }
+    if (!found) return jsonResp({ ok: true, found: false });
+    const { key: k, rec } = found;
+    return jsonResp({
+      ok: true, found: true, key: k, status: rec.status,
+      discord: rec.discord, hwidBound: !!rec.hwid,
+      created: rec.created, lastReset: rec.lastReset || 0,
+    });
+  }
+
+  if (!key) return jsonResp({ ok: false, reason: "missing key" }, 400);
+  const rec = await getKeyRecord(env, key);
+  if (!rec) return jsonResp({ ok: false, reason: "key not found" }, 404);
+
+  if (action === "revoke") {
+    rec.status = "blacklisted";
+    await putKeyRecord(env, key, rec);
+    return jsonResp({ ok: true, key });
+  }
+  if (action === "unrevoke") {
+    rec.status = "active";
+    await putKeyRecord(env, key, rec);
+    return jsonResp({ ok: true, key });
+  }
+  if (action === "delete") {
+    await env.KEYS.delete(key);
+    return jsonResp({ ok: true, key });
+  }
+  if (action === "redeem") {
+    const discordId = (body.discordId || "").trim();
+    if (!discordId) return jsonResp({ ok: false, reason: "missing discordId" }, 400);
+    if (rec.status !== "active") return jsonResp({ ok: false, reason: "this key is not active" });
+    if (rec.discord && rec.discord !== discordId) {
+      return jsonResp({ ok: false, reason: "this key is already redeemed by someone else" });
+    }
+    rec.discord = discordId;
+    await putKeyRecord(env, key, rec);
+    return jsonResp({ ok: true, key });
+  }
+  if (action === "link") {
+    rec.discord = (body.discordId || "").trim() || null;
+    await putKeyRecord(env, key, rec);
+    return jsonResp({ ok: true, key, discord: rec.discord });
+  }
+  if (action === "resethwid") {
+    // body.force (co-owner) skips the cooldown; buyers are limited to one
+    // reset per 24h. When body.discordId is given, it must own the key.
+    if (body.discordId && rec.discord !== body.discordId && !body.force) {
+      return jsonResp({ ok: false, reason: "that key isn't linked to you" });
+    }
+    const wait = (rec.lastReset || 0) + HWID_RESET_COOLDOWN_MS - Date.now();
+    if (!body.force && wait > 0) {
+      return jsonResp({ ok: false, reason: "reset on cooldown", retryInMs: wait });
+    }
+    rec.hwid = null;
+    rec.lastReset = Date.now();
+    await putKeyRecord(env, key, rec);
+    return jsonResp({ ok: true, key });
+  }
+  return jsonResp({ ok: false, reason: "unknown action" }, 404);
+}
+
+// Live gate: validates against KV, binds/checks the HWID, then decrypts
+// with the Worker-held master key. Returns a Response (or the payload).
+async function liveGate(env, sidecar, key, hwidRaw) {
+  const rec = await getKeyRecord(env, key);
+  if (!rec) return { error: "invalid key", status: 403, rec: null };
+  if (rec.status !== "active") return { error: "key is blacklisted", status: 403, rec };
+  if (!hwidRaw) return { error: "hwid required (update your loader)", status: 400, rec };
+  const hw = await sha256Hex("jhub|" + hwidRaw);
+  if (!rec.hwid) {
+    rec.hwid = hw;
+    await putKeyRecord(env, key, rec);
+  } else if (rec.hwid !== hw) {
+    return { error: "hwid mismatch - reset it with /resethwid in Discord", status: 403, rec };
+  }
+  const M = hexToBytes(env.MASTER_KEY);
+  if (
+    fnv1a32(M) !== sidecar.mhash ||
+    fnv1a32(concatBytes(strToBytes("check2|"), M)) !== sidecar.mhash2
+  ) {
+    return { error: "server misconfigured (master key mismatch)", status: 500, rec };
+  }
+  return { M, rec };
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -407,6 +619,10 @@ export default {
       return handleLinkKey(request, env);
     }
 
+    if (url.pathname.startsWith("/api/key/")) {
+      return handleKeyApi(request, env);
+    }
+
     const key =
       url.searchParams.get("key") ||
       request.headers.get("x-jhub-key") ||
@@ -414,6 +630,8 @@ export default {
     const robloxUser = url.searchParams.get("user") || "unknown";
     const jobId = url.searchParams.get("job") || "unknown";
     const ip = request.headers.get("cf-connecting-ip") || "unknown";
+    const hwidRaw = url.searchParams.get("hwid") || "";
+    const live = !!(env.KEYS && env.MASTER_KEY);
 
     if (!key) {
       return new Response("missing key", { status: 400 });
@@ -432,7 +650,25 @@ export default {
     }
     const sidecar = await sidecarResp.json();
 
-    const M = attemptUnlock(key, sidecar);
+    let M;
+    let liveRec = null;
+    if (live) {
+      const g = await liveGate(env, sidecar, normKey(key), hwidRaw);
+      if (g.error) {
+        ctx.waitUntil(
+          logExecution(env, ctx, {
+            status: g.status === 403 ? "INVALID/BLOCKED ATTEMPT: " + g.error : "ERROR: " + g.error,
+            key, user: robloxUser, job: jobId, ip,
+            ownerOverride: g.rec && g.rec.discord ? `<@${g.rec.discord}>` : null,
+          })
+        );
+        return new Response(g.error, { status: g.status });
+      }
+      M = g.M;
+      liveRec = g.rec;
+    } else {
+      M = attemptUnlock(key, sidecar);
+    }
     if (!M) {
       ctx.waitUntil(
         logExecution(env, ctx, {
@@ -453,6 +689,7 @@ export default {
         user: robloxUser,
         job: jobId,
         ip,
+        ownerOverride: liveRec && liveRec.discord ? `<@${liveRec.discord}>` : null,
       })
     );
 

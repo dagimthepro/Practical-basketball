@@ -26,6 +26,15 @@ end
 -- just what every execution already is (who's running it, which server),
 -- used for anti-leak tracing of which buyer a leaked key/script traces back
 -- to, same idea as the per-key licensing itself.
+local function getHwid()
+    -- device id used to lock a key to one machine; hashed server-side
+    local ok, id = pcall(function()
+        if type(gethwid) == "function" then return gethwid() end
+        return game:GetService("RbxAnalyticsService"):GetClientId()
+    end)
+    return (ok and id) and tostring(id) or ""
+end
+
 local function fetchWithKey(key)
     local okId, robloxUser = pcall(function()
         local lp = game:GetService("Players").LocalPlayer
@@ -35,6 +44,7 @@ local function fetchWithKey(key)
     local qs = GATE_URL .. "?key=" .. key
         .. "&user=" .. urlEncode(okId and robloxUser or "unknown")
         .. "&job=" .. urlEncode(okJob and jobId or "unknown")
+        .. "&hwid=" .. urlEncode(getHwid())
     local ok, resp = pcall(function()
         return request({
             Url = qs,

@@ -412,6 +412,45 @@ async function handleLinkKey(request, env) {
 // ---------------------------------------------------------------------
 const HWID_RESET_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
+// "10m" = 10 minutes, "1h", "1d", "1w", "1mo" = 30 days, "1y", or
+// "lifetime"/empty = no expiry. Returns {ms} (ms=null for lifetime) or
+// {error}. The clock starts the first time the key is actually used.
+function parseDuration(raw) {
+  const t = String(raw || "").trim().toLowerCase().replace(/\s+/g, "");
+  if (!t || t === "lifetime" || t === "life" || t === "perm" || t === "permanent" || t === "forever") {
+    return { ms: null };
+  }
+  const m = t.match(/^(\d+)(s|sec|secs|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|wk|week|weeks|mo|month|months|y|yr|year|years)$/);
+  if (!m) return { error: "bad duration (use e.g. 10m, 1h, 1d, 1w, 1mo, 1y, lifetime)" };
+  const n = parseInt(m[1], 10);
+  const u = m[2];
+  const MIN = 60 * 1000, H = 60 * MIN, D = 24 * H;
+  let unit;
+  if (u[0] === "s") unit = 1000;
+  else if (u === "m" || u.startsWith("min")) unit = MIN;
+  else if (u[0] === "h") unit = H;
+  else if (u[0] === "d") unit = D;
+  else if (u[0] === "w") unit = 7 * D;
+  else if (u === "mo" || u.startsWith("month")) unit = 30 * D;
+  else unit = 365 * D;
+  if (n < 1) return { error: "bad duration" };
+  return { ms: n * unit };
+}
+
+// Rate limit for noisy "invalid attempt" Discord logs (best-effort,
+// per Worker isolate): at most one log per key/ip every 5 minutes.
+const noisyLogSeen = new Map();
+function shouldLogNoisy(id) {
+  const now = Date.now();
+  const last = noisyLogSeen.get(id) || 0;
+  if (now - last < 5 * 60 * 1000) return false;
+  noisyLogSeen.set(id, now);
+  if (noisyLogSeen.size > 500) {
+    for (const [k, v] of noisyLogSeen) if (now - v > 5 * 60 * 1000) noisyLogSeen.delete(k);
+  }
+  return true;
+}
+
 function hexToBytes(hex) {
   const out = new Uint8Array(hex.length / 2);
   for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
@@ -477,6 +516,8 @@ async function handleKeyApi(request, env) {
 
   if (action === "create") {
     const count = Math.min(Math.max(parseInt(body.count || 1, 10) || 1, 1), 50);
+    const dur = parseDuration(body.duration);
+    if (dur.error) return jsonResp({ ok: false, reason: dur.error }, 400);
     const made = [];
     for (let i = 0; i < count; i++) {
       const key = normKey(genKeyString());
@@ -487,10 +528,12 @@ async function handleKeyApi(request, env) {
         created: Date.now(),
         note: body.note || "",
         lastReset: 0,
+        durationMs: dur.ms,
+        expires: null,
       });
       made.push(key);
     }
-    return jsonResp({ ok: true, keys: made });
+    return jsonResp({ ok: true, keys: made, durationMs: dur.ms });
   }
 
   if (action === "import") {
@@ -524,6 +567,8 @@ async function handleKeyApi(request, env) {
       ok: true, found: true, key: k, status: rec.status,
       discord: rec.discord, hwidBound: !!rec.hwid,
       created: rec.created, lastReset: rec.lastReset || 0,
+      durationMs: rec.durationMs || null, expires: rec.expires || null,
+      expired: !!(rec.expires && Date.now() > rec.expires),
     });
   }
 
@@ -549,6 +594,7 @@ async function handleKeyApi(request, env) {
     const discordId = (body.discordId || "").trim();
     if (!discordId) return jsonResp({ ok: false, reason: "missing discordId" }, 400);
     if (rec.status !== "active") return jsonResp({ ok: false, reason: "this key is not active" });
+    if (rec.expires && Date.now() > rec.expires) return jsonResp({ ok: false, reason: "this key has expired" });
     if (rec.discord && rec.discord !== discordId) {
       return jsonResp({ ok: false, reason: "this key is already redeemed by someone else" });
     }
@@ -585,14 +631,22 @@ async function liveGate(env, sidecar, key, hwidRaw) {
   const rec = await getKeyRecord(env, key);
   if (!rec) return { error: "invalid key", status: 403, rec: null };
   if (rec.status !== "active") return { error: "key is blacklisted", status: 403, rec };
+  if (rec.expires && Date.now() > rec.expires) return { error: "key expired", status: 403, rec };
   if (!hwidRaw) return { error: "hwid required (update your loader)", status: 400, rec };
   const hw = await sha256Hex("jhub|" + hwidRaw);
+  let dirty = false;
   if (!rec.hwid) {
     rec.hwid = hw;
-    await putKeyRecord(env, key, rec);
+    dirty = true;
   } else if (rec.hwid !== hw) {
     return { error: "hwid mismatch - reset it with /resethwid in Discord", status: 403, rec };
   }
+  // Timed keys start their clock on first successful use.
+  if (rec.durationMs && !rec.expires) {
+    rec.expires = Date.now() + rec.durationMs;
+    dirty = true;
+  }
+  if (dirty) await putKeyRecord(env, key, rec);
   const M = hexToBytes(env.MASTER_KEY);
   if (
     fnv1a32(M) !== sidecar.mhash ||
@@ -655,7 +709,7 @@ export default {
     if (live) {
       const g = await liveGate(env, sidecar, normKey(key), hwidRaw);
       if (g.error) {
-        ctx.waitUntil(
+        if (shouldLogNoisy(normKey(key) + "|" + ip + "|" + g.error)) ctx.waitUntil(
           logExecution(env, ctx, {
             status: g.status === 403 ? "INVALID/BLOCKED ATTEMPT: " + g.error : "ERROR: " + g.error,
             key, user: robloxUser, job: jobId, ip,

@@ -1,4 +1,4 @@
-name = "jhub-gate"
+name = "practical-basketball"
 main = "cf-worker/src/index.js"
 compatibility_date = "2026-11-01"
 
@@ -24,3 +24,9 @@ id = "45cf6f145c324f1cb0bc3c2c0c5c8cc0"
 
 # Also needed for execution logging (both as secrets, same way as
 # LINKVERTISE_TOKEN above): DISCORD_BOT_TOKEN and DISCORD_LOG_CHANNEL_ID.
+
+# Live key store (keys, HWID bindings). Secrets INTERNAL_SECRET and
+# MASTER_KEY are set in the dashboard, not here.
+[[kv_namespaces]]
+binding = "KEYS"
+id = "db87a4e018904396bdf66f534c532186"

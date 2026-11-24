@@ -627,7 +627,7 @@ async function handleKeyApi(request, env) {
 
 // Live gate: validates against KV, binds/checks the HWID, then decrypts
 // with the Worker-held master key. Returns a Response (or the payload).
-async function liveGate(env, sidecar, key, hwidRaw) {
+async function liveGate(env, key, hwidRaw) {
   const rec = await getKeyRecord(env, key);
   if (!rec) return { error: "invalid key", status: 403, rec: null };
   if (rec.status !== "active") return { error: "key is blacklisted", status: 403, rec };
@@ -647,14 +647,47 @@ async function liveGate(env, sidecar, key, hwidRaw) {
     dirty = true;
   }
   if (dirty) await putKeyRecord(env, key, rec);
+  return { rec };
+}
+
+// The decrypted script is the same for every valid key, and building it (download ~7.7MB, parse,
+// base64-decode, un-XOR) is heavy. Doing that on every request, twice at once for two accounts,
+// is what made the Worker hit its resource limit (Cloudflare error 1102). Build it once, keep it
+// in memory for a short while, and share one build between simultaneous requests. Keys are still
+// checked against KV on every request, so a revoked key stops working immediately.
+const PAYLOAD_TTL_MS = 120000;
+let payloadCache = null;
+let payloadInflight = null;
+
+async function buildLivePayload(env) {
+  const resp = await fetch(SIDECAR_URL + "?_=" + Date.now(), { cf: { cacheTtl: 0 } });
+  if (!resp.ok) return { error: "sidecar unavailable", status: 502 };
+  const sidecar = await resp.json();
   const M = hexToBytes(env.MASTER_KEY);
   if (
     fnv1a32(M) !== sidecar.mhash ||
     fnv1a32(concatBytes(strToBytes("check2|"), M)) !== sidecar.mhash2
   ) {
-    return { error: "server misconfigured (master key mismatch)", status: 500, rec };
+    return { error: "server misconfigured (master key mismatch)", status: 500 };
   }
-  return { M, rec };
+  return { bytes: reconstruct(M, sidecar) };
+}
+
+async function getLivePayload(env) {
+  if (payloadCache && Date.now() - payloadCache.at < PAYLOAD_TTL_MS) return payloadCache.value;
+  if (!payloadInflight) {
+    payloadInflight = buildLivePayload(env)
+      .then((value) => {
+        if (value.bytes) payloadCache = { at: Date.now(), value };
+        return value;
+      })
+      .finally(() => {
+        payloadInflight = null;
+      });
+  }
+  const value = await payloadInflight;
+  if (!value.bytes && payloadCache) return payloadCache.value; // keep serving the last good build
+  return value;
 }
 
 export default {
@@ -691,23 +724,19 @@ export default {
       return new Response("missing key", { status: 400 });
     }
 
-    // GitHub's raw.githubusercontent.com CDN caches by URL for several
-    // minutes regardless of our own cache directives, which would delay a
-    // revocation taking effect. A cache-busting query param defeats both
-    // that CDN's cache and Cloudflare's own edge cache, so a key removed
-    // from keys.txt stops working on the very next request, not minutes
-    // later.
-    const bustedUrl = SIDECAR_URL + "?_=" + Date.now();
-    const sidecarResp = await fetch(bustedUrl, { cf: { cacheTtl: 0 } });
-    if (!sidecarResp.ok) {
-      return new Response("sidecar unavailable", { status: 502 });
-    }
-    const sidecar = await sidecarResp.json();
-
     let M;
     let liveRec = null;
+    let sidecar = null;
+    if (!live) {
+      // Legacy mode (no live key store): the sidecar itself holds the per-key unlock data.
+      const sidecarResp = await fetch(SIDECAR_URL + "?_=" + Date.now(), { cf: { cacheTtl: 0 } });
+      if (!sidecarResp.ok) {
+        return new Response("sidecar unavailable", { status: 502 });
+      }
+      sidecar = await sidecarResp.json();
+    }
     if (live) {
-      const g = await liveGate(env, sidecar, normKey(key), hwidRaw);
+      const g = await liveGate(env, normKey(key), hwidRaw);
       if (g.error) {
         if (shouldLogNoisy(normKey(key) + "|" + ip + "|" + g.error)) ctx.waitUntil(
           logExecution(env, ctx, {
@@ -718,8 +747,8 @@ export default {
         );
         return new Response(g.error, { status: g.status });
       }
-      M = g.M;
       liveRec = g.rec;
+      M = true;
     } else {
       M = attemptUnlock(key, sidecar);
     }
@@ -747,7 +776,14 @@ export default {
       })
     );
 
-    const payload = reconstruct(M, sidecar);
+    let payload;
+    if (live) {
+      const built = await getLivePayload(env);
+      if (!built.bytes) return new Response(built.error, { status: built.status });
+      payload = built.bytes;
+    } else {
+      payload = reconstruct(M, sidecar);
+    }
     return new Response(payload, {
       status: 200,
       headers: { "content-type": "text/plain; charset=utf-8" },

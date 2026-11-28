@@ -454,13 +454,14 @@ function parseDuration(raw) {
 // Rate limit for noisy "invalid attempt" Discord logs (best-effort,
 // per Worker isolate): at most one log per key/ip every 5 minutes.
 const noisyLogSeen = new Map();
-function shouldLogNoisy(id) {
+function shouldLogNoisy(id, windowMs) {
+  const win = windowMs || 5 * 60 * 1000;
   const now = Date.now();
   const last = noisyLogSeen.get(id) || 0;
-  if (now - last < 5 * 60 * 1000) return false;
+  if (now - last < win) return false;
   noisyLogSeen.set(id, now);
   if (noisyLogSeen.size > 500) {
-    for (const [k, v] of noisyLogSeen) if (now - v > 5 * 60 * 1000) noisyLogSeen.delete(k);
+    for (const [k, v] of noisyLogSeen) if (now - v > 15 * 60 * 1000) noisyLogSeen.delete(k);
   }
   return true;
 }
@@ -774,7 +775,7 @@ export default {
       M = attemptUnlock(key, sidecar);
     }
     if (!M) {
-      ctx.waitUntil(
+      if (shouldLogNoisy("badkey|" + ip)) ctx.waitUntil(
         logExecution(env, ctx, {
           status: "INVALID KEY ATTEMPT",
           key,
@@ -786,7 +787,10 @@ export default {
       return new Response("invalid key", { status: 403 });
     }
 
-    ctx.waitUntil(
+    // One "valid execution" message per key + Roblox user per 10 minutes (best-effort,
+    // per Worker isolate). Autoexec re-runs on every server hop, which used to post one
+    // message per run.
+    if (shouldLogNoisy("ok|" + normKey(key) + "|" + String(robloxUser || ""), 10 * 60 * 1000)) ctx.waitUntil(
       logExecution(env, ctx, {
         status: "valid execution",
         key,

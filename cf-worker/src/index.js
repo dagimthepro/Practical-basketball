@@ -287,8 +287,6 @@ async function logExecution(env, ctx, fields) {
     `Key: \`${clean(fields.key, 64)}\``,
     owner ? `Discord buyer: ${owner}` : null,
     `Roblox user: ${clean(fields.user, 64)}`,
-    `Job ID: \`${clean(fields.job, 64)}\``,
-    `IP: ${clean(fields.ip, 64)}`,
   ].filter(Boolean);
   // Caller wraps this whole function in ctx.waitUntil -- just await here.
   await fetch(
